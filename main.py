@@ -133,6 +133,8 @@ PROFILE_FIELDS = [
     ("address", "ที่อยู่"),
     ("line_id", "Line ID"),
     ("x_handle", "X / Twitter"),
+    ("national_id", "เลขบัตรประชาชน (13 หลัก)"),
+    ("account", "บัญชี/Username (เช่น ระบบจองบัตร, เกม, สมาชิก)"),
     ("upload_file", "ไฟล์ที่จะแนบ (ที่อยู่ไฟล์ ใช้กับข้ออัปโหลด)"),
 ]
 
@@ -144,13 +146,33 @@ NAME_MODES = {
 NAME_MODE_LABELS = list(NAME_MODES.keys())
 
 MODEL_SUGGESTIONS = [
+    "qwen3:8b",      # แนะนำ - จุดคุ้มสุดสำหรับ RAM 16GB ขึ้นไป
+    "qwen3.6",       # ฉลาดสุดในกลุ่มที่รันในเครื่องได้ (ต้องการ RAM/VRAM ~32GB)
+    "gemma4:12b",    # ทางเลือกสำหรับเครื่อง RAM 16GB
+    "gpt-oss:20b",   # เน้นให้เหตุผล (ต้องการเครื่องแรง)
+    "qwen2.5:1.5b",  # เครื่องเบา/RAM 8GB
     "qwen3:1.7b",
-    "qwen2.5:1.5b",
-    "qwen2.5:3b",
     "gemma3:1b",
-    "gemma3:4b",
-    "llama3.2:3b",
 ]
+
+# ---- ผู้ให้บริการ AI ----
+PROVIDER_LABELS = [
+    "Ollama (ในเครื่อง, ฟรี)",
+    "Claude API (Anthropic)",
+    "API อื่น (OpenAI-compatible)",
+]
+PROVIDER_KEYS = {
+    PROVIDER_LABELS[0]: "ollama",
+    PROVIDER_LABELS[1]: "anthropic",
+    PROVIDER_LABELS[2]: "custom",
+}
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+# เรียงจากเร็ว/ถูกสุด -> ฉลาดสุด
+ANTHROPIC_MODELS = ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5-5"]
+
+OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
 
 FORM_PATTERN = re.compile(
     r"(docs\.google\.com/forms|forms\.gle|forms\.google\.com|google\.com/forms)",
@@ -209,6 +231,12 @@ SUCCESS_PHRASES = (
 ERROR_REQUIRED = (
     "คำถามนี้จำเป็น",
     "this is a required question",
+)
+
+DEFAULT_KNOWLEDGE = (
+    "คู่จิ้น (ศิลปิน 2 คนที่แสดงคู่กันบ่อย) ที่อยู่กับ GMMTV มายาวนานที่สุดคู่หนึ่งคือ "
+    "คริส-สิงโต (คริส พีรวัส แสงโพธิรัตน์ และ สิงโต ปราชญา เรืองโรจน์) "
+    "เริ่มมีชื่อเสียงจากซีรีส์ SOTUS ปี 2559-2560 และยังร่วมงานกับ GMMTV ต่อเนื่องถึงปัจจุบัน (2568)\n"
 )
 
 CLOSED_PHRASES = (
@@ -275,6 +303,7 @@ class MonitorState:
         self.done_forms = done_forms
         self.sem = sem
         self.tasks = set()
+        self.processed = 0  # จำนวนโพสต์ที่ผ่านตัวกรอง (วันที่/คีย์เวิร์ด) แล้วถูกนำไปกรอกฟอร์ม
 
 
 class FormBotGUI:
@@ -314,6 +343,7 @@ class FormBotGUI:
         self.load_config()
         self.update_ui_state()
         self.root.after(60, self.poll_ui)
+        self.on_provider_changed()
         self.refresh_models()
         self.refresh_setup()
         self.start_check()
@@ -435,6 +465,40 @@ class FormBotGUI:
             foreground="gray",
         ).pack(anchor="w", pady=(6, 0))
 
+        key_frame = ttk.LabelFrame(t1, text=" 🔑 คีย์วันงาน & จำกัดจำนวนโพสต์ ", padding=8)
+        key_frame.pack(fill="x", pady=(8, 0))
+
+        krow1 = ttk.Frame(key_frame)
+        krow1.pack(fill="x")
+        ttk.Label(krow1, text="คีย์ที่เปิดใช้งาน (เช่น 01 หรือ 01,02 / เว้นว่าง = ทำทุกวัน):").pack(side="left")
+        self.keys_entry = ttk.Entry(krow1)
+        self.keys_entry.pack(side="left", fill="x", expand=True, padx=8)
+
+        self.notag_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            key_frame, text="ถ้าโพสต์ไม่มีป้ายวันที่ (เช่น 'วันที่ 01') เลย ให้ทำด้วย",
+            variable=self.notag_var,
+        ).pack(anchor="w", pady=(4, 0))
+
+        krow2 = ttk.Frame(key_frame)
+        krow2.pack(fill="x", pady=(6, 0))
+        ttk.Label(krow2, text="จำกัดจำนวนโพสต์ที่ทำต่อการรัน (0 = ไม่จำกัด):").pack(side="left")
+        self.post_limit_var = tk.IntVar(value=10)
+        Spin(krow2, from_=0, to=9999, width=6, textvariable=self.post_limit_var).pack(
+            side="left", padx=8
+        )
+        self.unlock_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            krow2, text="🔓 ปลดล็อก (ไม่จำกัดจำนวนโพสต์)", variable=self.unlock_var
+        ).pack(side="left", padx=(16, 0))
+
+        ttk.Label(
+            key_frame,
+            text="ระบุตัวอย่าง: โพสต์มีข้อความ 'วันที่ 01' คีย์ 01 จะทำ, คีย์ 02 จะข้าม, คีย์ 01,02 จะทำทั้งคู่ "
+                 "นับเฉพาะโพสต์ที่ผ่านตัวกรองวันที่/คีย์เวิร์ดแล้วเท่านั้น",
+            foreground="gray", wraplength=650, justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
         url_frame = ttk.LabelFrame(
             t1, text=" Google Form เดี่ยว (ใช้กับปุ่มทดสอบ / เมื่อไม่ใส่ X URL) ", padding=8
         )
@@ -462,7 +526,26 @@ class FormBotGUI:
         self.set_combo.grid(row=1, column=1, sticky="ew", padx=10, pady=3)
         self.set_combo.bind("<<ComboboxSelected>>", self.on_set_changed)
 
-        r = 2
+        lm_frame = ttk.LabelFrame(
+            t2, text=" กำหนดชุดข้อมูลต่อ 1 ลิงก์เอง (ไม่บังคับ, ใช้แทนกฎด้านบนได้) ", padding=6
+        )
+        lm_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 10))
+
+        ttk.Label(
+            lm_frame,
+            justify="left",
+            foreground="gray",
+            text=(
+                "1 บรรทัดต่อ 1 ลิงก์:   เลขลิงก์ => รายชุดข้อมูล (คั่นด้วย , หรือเขียนช่วงด้วย -)\n"
+                "ตัวอย่าง  1 => 1-5   หมายถึง ลิงก์ที่ 1 ให้กรอกซ้ำ 5 รอบด้วยชุดข้อมูล 1,2,3,4,5\n"
+                "ใช้ * แทนเลขลิงก์ เพื่อใช้กฎเดียวกันกับทุกลิงก์ที่ไม่ได้ระบุไว้ด้านบน / เว้นว่างทั้งหมด = ใช้กฎด้านบนตามปกติ"
+            ),
+        ).pack(anchor="w")
+
+        self.link_map_box = tk.Text(lm_frame, height=3, wrap="none")
+        self.link_map_box.pack(fill="x", pady=(4, 0))
+
+        r = 3
         for key, label in PROFILE_FIELDS:
             ttk.Label(t2, text=label).grid(row=r, column=0, sticky="w", pady=2)
             e = ttk.Entry(t2)
@@ -471,7 +554,7 @@ class FormBotGUI:
             r += 1
 
         ttk.Label(t2, text="เมื่อฟอร์มถามแค่ 'ชื่อ'").grid(
-            row=r, column=0, sticky="w", pady=(6, 2)
+            row=r, column=0, sticky="w", pady=(10, 2)
         )
         self.name_mode_var = tk.StringVar(value=NAME_MODE_LABELS[0])
         ttk.Combobox(
@@ -493,11 +576,24 @@ class FormBotGUI:
         t3 = ttk.Frame(nb, padding=10)
         nb.add(t3, text="  AI & ตัวเลือก  ")
 
-        ai_frame = ttk.LabelFrame(t3, text=" Local AI (Ollama) ", padding=8)
-        ai_frame.pack(fill="x")
+        provider_row = ttk.Frame(t3)
+        provider_row.pack(fill="x")
+        ttk.Label(provider_row, text="ผู้ให้บริการ AI:").pack(side="left")
+        self.provider_var = tk.StringVar(value=PROVIDER_LABELS[0])
+        self.provider_combo = ttk.Combobox(
+            provider_row, textvariable=self.provider_var, values=PROVIDER_LABELS, state="readonly"
+        )
+        self.provider_combo.pack(side="left", fill="x", expand=True, padx=8)
+        self.provider_combo.bind("<<ComboboxSelected>>", self.on_provider_changed)
+
+        provider_container = ttk.Frame(t3)
+        provider_container.pack(fill="x", pady=(8, 0))
+        self.provider_container = provider_container
+
+        ai_frame = ttk.LabelFrame(provider_container, text=" Local AI (Ollama) ", padding=8)
 
         ttk.Label(ai_frame, text="โมเดล:").grid(row=0, column=0, sticky="w")
-        self.model_var = tk.StringVar(value="qwen3:1.7b")
+        self.model_var = tk.StringVar(value="qwen3:8b")
         self.model_combo = ttk.Combobox(
             ai_frame, textvariable=self.model_var, values=MODEL_SUGGESTIONS
         )
@@ -519,6 +615,94 @@ class FormBotGUI:
         self.ai_status = ttk.Label(ai_frame, text="กำลังตรวจ Ollama...", foreground="gray")
         self.ai_status.grid(row=2, column=0, columnspan=4, sticky="w")
         ai_frame.columnconfigure(1, weight=1)
+
+        # ---------- Claude API ----------
+        anthropic_frame = ttk.LabelFrame(provider_container, text=" Claude API (Anthropic) ", padding=8)
+
+        ttk.Label(anthropic_frame, text="API key:").grid(row=0, column=0, sticky="w")
+        self.anthropic_key_var = tk.StringVar()
+        self.anthropic_key_entry = ttk.Entry(
+            anthropic_frame, textvariable=self.anthropic_key_var, show="•"
+        )
+        self.anthropic_key_entry.grid(row=0, column=1, sticky="ew", padx=8)
+        self.anthropic_show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            anthropic_frame, text="แสดง", variable=self.anthropic_show_var,
+            command=lambda: self.toggle_key_visibility(self.anthropic_key_entry, self.anthropic_show_var),
+        ).grid(row=0, column=2, padx=4)
+
+        ttk.Label(anthropic_frame, text="โมเดล:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.anthropic_model_var = tk.StringVar(value=ANTHROPIC_MODELS[1])
+        ttk.Combobox(
+            anthropic_frame, textvariable=self.anthropic_model_var, values=ANTHROPIC_MODELS, state="readonly"
+        ).grid(row=1, column=1, sticky="ew", padx=8, pady=(6, 0))
+
+        ttk.Label(
+            anthropic_frame,
+            text="Haiku = เร็ว/ถูกสุด   ·   Sonnet = สมดุล (แนะนำ)   ·   Opus = ฉลาดสุด (แพงกว่า/ช้ากว่า)",
+            foreground="gray",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 6))
+
+        self.anthropic_test_btn = ttk.Button(
+            anthropic_frame, text="🔌 ทดสอบการเชื่อมต่อ",
+            command=lambda: self.start_test_connection("anthropic"),
+        )
+        self.anthropic_test_btn.grid(row=3, column=0, sticky="w")
+        self.anthropic_status = ttk.Label(anthropic_frame, text="", foreground="gray")
+        self.anthropic_status.grid(row=3, column=1, columnspan=2, sticky="w", padx=8)
+
+        ttk.Label(
+            anthropic_frame,
+            text="สมัคร/ดู API key ได้ที่ console.anthropic.com  ·  เก็บ key ไว้ในเครื่องแบบข้อความธรรมดา อย่าแชร์ไฟล์ตั้งค่า",
+            foreground="#b45309", wraplength=650, justify="left",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        anthropic_frame.columnconfigure(1, weight=1)
+
+        # ---------- Custom / OpenAI-compatible API ----------
+        custom_frame = ttk.LabelFrame(provider_container, text=" API อื่น (เข้ากันได้กับ OpenAI เช่น OpenAI, Groq, OpenRouter) ", padding=8)
+
+        ttk.Label(custom_frame, text="Base URL:").grid(row=0, column=0, sticky="w")
+        self.custom_base_var = tk.StringVar(value=OPENAI_DEFAULT_BASE)
+        ttk.Entry(custom_frame, textvariable=self.custom_base_var).grid(
+            row=0, column=1, sticky="ew", padx=8
+        )
+
+        ttk.Label(custom_frame, text="API key:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.custom_key_var = tk.StringVar()
+        self.custom_key_entry = ttk.Entry(custom_frame, textvariable=self.custom_key_var, show="•")
+        self.custom_key_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=(6, 0))
+        self.custom_show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            custom_frame, text="แสดง", variable=self.custom_show_var,
+            command=lambda: self.toggle_key_visibility(self.custom_key_entry, self.custom_show_var),
+        ).grid(row=1, column=2, padx=4, pady=(6, 0))
+
+        ttk.Label(custom_frame, text="ชื่อโมเดล:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.custom_model_var = tk.StringVar()
+        ttk.Entry(custom_frame, textvariable=self.custom_model_var).grid(
+            row=2, column=1, sticky="ew", padx=8, pady=(6, 0)
+        )
+        ttk.Label(custom_frame, text="เช่น gpt-4o-mini", foreground="gray").grid(
+            row=2, column=2, sticky="w", pady=(6, 0)
+        )
+
+        self.custom_test_btn = ttk.Button(
+            custom_frame, text="🔌 ทดสอบการเชื่อมต่อ",
+            command=lambda: self.start_test_connection("custom"),
+        )
+        self.custom_test_btn.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.custom_status = ttk.Label(custom_frame, text="", foreground="gray")
+        self.custom_status.grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(6, 0))
+
+        ttk.Label(
+            custom_frame,
+            text="ใส่ Base URL และชื่อโมเดลให้ตรงกับผู้ให้บริการนั้นๆ  ·  key เก็บในเครื่องแบบข้อความธรรมดา อย่าแชร์ไฟล์ตั้งค่า",
+            foreground="#b45309", wraplength=650, justify="left",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        custom_frame.columnconfigure(1, weight=1)
+
+        self.provider_frames = {"ollama": ai_frame, "anthropic": anthropic_frame, "custom": custom_frame}
+        ai_frame.pack(fill="x")
 
         opt = ttk.LabelFrame(t3, text=" ตัวเลือก ", padding=8)
         opt.pack(fill="x", pady=(8, 0))
@@ -591,6 +775,21 @@ class FormBotGUI:
         )
         self.answers_box.pack(fill="both", expand=True, pady=6)
         self.answers_box.insert("1.0", self.answers_text)
+
+        kb_frame = ttk.LabelFrame(
+            t4, text=" ความรู้พื้นฐานสำหรับ AI เช่น เรื่อง GMMTV (ไม่บังคับ) ", padding=6
+        )
+        kb_frame.pack(fill="x", pady=(0, 6))
+        ttk.Label(
+            kb_frame, foreground="gray", justify="left",
+            text="ข้อมูลพื้นฐาน/ข้อเท็จจริงที่ AI ควรรู้ไว้ล่วงหน้า (คนละส่วนกับคำถาม-คำตอบด้านบน) "
+                 "AI จะใช้ประกอบการตอบข้อที่ไม่ได้กำหนดคำตอบไว้ ใส่เฉพาะสิ่งที่มั่นใจว่าถูกต้อง เพราะถ้าผิดจะทำให้ตอบฟอร์มผิดไปด้วย",
+        ).pack(anchor="w")
+        self.knowledge_box = scrolledtext.ScrolledText(
+            kb_frame, wrap="word", font=(UI_FONT, 10), height=6
+        )
+        self.knowledge_box.pack(fill="x", pady=(4, 0))
+        self.knowledge_box.insert("1.0", DEFAULT_KNOWLEDGE)
 
         tf = ttk.Frame(t4)
         tf.pack(fill="x")
@@ -711,6 +910,78 @@ class FormBotGUI:
                 return p, f"ชุด {link_no}"
 
         return main, "ชุดหลัก"
+
+    @staticmethod
+    def parse_keys(text):
+        """แปลงข้อความคีย์ เช่น '01,02' เป็นเซตตัวเลข {1, 2}"""
+        keys = set()
+        for part in re.split(r"[,\s]+", (text or "").strip()):
+            if part.isdigit():
+                keys.add(int(part))
+        return keys
+
+    @staticmethod
+    def extract_post_day(text):
+        """หาป้ายวันที่ในข้อความโพสต์ เช่น 'วันที่ 01' หรือ 'Day 1' คืนเป็นเลข หรือ None ถ้าไม่พบ"""
+        m = re.search(r"(?:วันที่|วัน|day)\s*0*([0-9]{1,3})\b", text or "", re.I)
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def parse_link_map(text):
+        """แปลงข้อความ 'เลขลิงก์ => รายชุดข้อมูล' เป็น dict {เลขลิงก์หรือ None(=*): [เลขชุด, ...]}"""
+        result = {}
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line or "=>" not in line:
+                continue
+            key_s, val_s = line.split("=>", 1)
+            key_s = key_s.strip()
+
+            key = None if key_s in ("*", "") else None
+            if key_s not in ("*", ""):
+                m = re.match(r"^\d+$", key_s)
+                if not m:
+                    continue
+                key = int(key_s)
+
+            sets = []
+            for part in re.split(r"[,\s]+", val_s.strip()):
+                if not part:
+                    continue
+                m = re.match(r"^(\d+)-(\d+)$", part)
+                if m:
+                    a, b = int(m.group(1)), int(m.group(2))
+                    step = 1 if b >= a else -1
+                    sets.extend(range(a, b + step, step))
+                elif part.isdigit():
+                    sets.append(int(part))
+
+            if sets:
+                result[key] = sets
+
+        return result
+
+    def resolve_set(self, idx, settings):
+        """เลข 0 หรือเลขนอกช่วง 1-NUM_EXTRA_SETS = ชุดหลัก, เลข 1-10 = ชุดนั้น (ถ้าว่างจะใช้ชุดหลักแทน)"""
+        profiles = settings["profiles"]
+        if 1 <= idx <= NUM_EXTRA_SETS:
+            p = profiles[idx]
+            if not self.profile_is_empty(p):
+                return p, f"ชุด {idx}"
+        return profiles[0], "ชุดหลัก"
+
+    def get_link_profiles(self, link_no, settings):
+        """คืน list ของ (profile, label) ที่ต้องใช้กรอกลิงก์นี้ (ปกติมี 1 รายการ อาจมีหลายรายการถ้าตั้งค่าไว้)"""
+        link_map = settings.get("link_map") or {}
+
+        sets = link_map.get(link_no)
+        if sets is None:
+            sets = link_map.get(None)  # กฎ '*'
+
+        if sets:
+            return [self.resolve_set(i, settings) for i in sets]
+
+        return [self.pick_profile(link_no, settings)]
 
     # =========================================================
     # LOGIN (Google / X)
@@ -1016,21 +1287,36 @@ class FormBotGUI:
         else:
             b_txt, b_ok = "❌ ยังไม่มี Browser", False
 
-        if d["api"]:
-            o_txt, o_ok = "✅ ติดตั้งแล้วและกำลังทำงาน", True
-        elif d["exe"]:
-            o_txt, o_ok = "⚠️ ติดตั้งแล้ว แต่ยังไม่ได้เปิด (กดปุ่มเพื่อเปิด)", False
-        else:
-            o_txt, o_ok = "❌ ยังไม่ได้ติดตั้ง (ไม่จำเป็น ถ้ากำหนดคำตอบเองครบ)", False
+        provider = self.current_provider_key()
 
-        self.set_models(d["names"] if d["api"] else None)
-        model = self.model_var.get().strip()
-        if not d["api"]:
-            m_txt, m_ok = "— (ต้องเปิด Ollama ก่อน)", False
-        elif self.model_installed(model):
-            m_txt, m_ok = f"✅ มีโมเดล {model} แล้ว", True
+        if provider != "ollama":
+            self.set_models(d["names"] if d["api"] else None)
+            cfg = self.collect_ai_config()
+            ok, msg = self.ai_provider_ready(cfg)
+            label = "Claude API" if provider == "anthropic" else "API ภายนอก"
+            o_txt, o_ok = f"✅ ใช้ {label} แทน (ไม่ต้องใช้ Ollama)", True
+            m_txt, m_ok = (msg, ok)
+            for b in (self.btn_ollama, self.btn_model_setup):
+                b.config(state="disabled")
         else:
-            m_txt, m_ok = f"⬇️ ยังไม่มีโมเดล {model}", False
+            for b in (self.btn_ollama, self.btn_model_setup):
+                b.config(state="normal" if not self.busy else "disabled")
+
+            if d["api"]:
+                o_txt, o_ok = "✅ ติดตั้งแล้วและกำลังทำงาน", True
+            elif d["exe"]:
+                o_txt, o_ok = "⚠️ ติดตั้งแล้ว แต่ยังไม่ได้เปิด (กดปุ่มเพื่อเปิด)", False
+            else:
+                o_txt, o_ok = "❌ ยังไม่ได้ติดตั้ง (ไม่จำเป็น ถ้ากำหนดคำตอบเองครบ)", False
+
+            self.set_models(d["names"] if d["api"] else None)
+            model = self.model_var.get().strip()
+            if not d["api"]:
+                m_txt, m_ok = "— (ต้องเปิด Ollama ก่อน)", False
+            elif self.model_installed(model):
+                m_txt, m_ok = f"✅ มีโมเดล {model} แล้ว", True
+            else:
+                m_txt, m_ok = f"⬇️ ยังไม่มีโมเดล {model}", False
 
         self.setup_state = {"browser": b_ok, "ollama": o_ok, "model": m_ok}
 
@@ -1307,6 +1593,189 @@ class FormBotGUI:
         threading.Thread(target=work, daemon=True).start()
 
     # =========================================================
+    # AI PROVIDER (Ollama / Claude API / API อื่น)
+    # =========================================================
+
+    @staticmethod
+    def toggle_key_visibility(entry, show_var):
+        entry.config(show="" if show_var.get() else "•")
+
+    def on_provider_changed(self, _e=None):
+        key = PROVIDER_KEYS.get(self.provider_var.get(), "ollama")
+        for k, frame in self.provider_frames.items():
+            frame.pack_forget()
+        self.provider_frames[key].pack(fill="x")
+        self.refresh_setup()
+
+    def current_provider_key(self):
+        return PROVIDER_KEYS.get(self.provider_var.get(), "ollama")
+
+    def collect_ai_config(self):
+        """อ่านค่าตั้งค่า AI ปัจจุบันจากหน้าจอ (ใช้ทั้งตอนเริ่มบอทจริงและตอนกดทดสอบการเชื่อมต่อ)"""
+        return {
+            "provider": self.current_provider_key(),
+            "model": self.model_var.get().strip(),
+            "anthropic_key": self.anthropic_key_var.get().strip(),
+            "anthropic_model": self.anthropic_model_var.get().strip() or ANTHROPIC_MODELS[1],
+            "custom_base": self.custom_base_var.get().strip() or OPENAI_DEFAULT_BASE,
+            "custom_key": self.custom_key_var.get().strip(),
+            "custom_model": self.custom_model_var.get().strip(),
+        }
+
+    def ai_provider_ready(self, cfg):
+        """คืน (พร้อมไหม, ข้อความสถานะ)"""
+        p = cfg["provider"]
+        if p == "ollama":
+            return True, ""  # เช็กแยกผ่าน Ollama tags อยู่แล้วใน render_setup
+        if p == "anthropic":
+            if not cfg["anthropic_key"]:
+                return False, "❌ ยังไม่ได้ใส่ Anthropic API key"
+            return True, f"✅ ใช้ Claude API ({cfg['anthropic_model']})"
+        if p == "custom":
+            if not cfg["custom_model"]:
+                return False, "❌ ยังไม่ได้ใส่ชื่อโมเดล"
+            return True, f"✅ ใช้ API ภายนอก ({cfg['custom_model']})"
+        return False, "❌ ไม่รู้จักผู้ให้บริการ"
+
+    def start_test_connection(self, provider):
+        cfg = self.collect_ai_config()
+        cfg["provider"] = provider
+        lbl = self.anthropic_status if provider == "anthropic" else self.custom_status
+        btn = self.anthropic_test_btn if provider == "anthropic" else self.custom_test_btn
+
+        ok, msg = self.ai_provider_ready(cfg)
+        if not ok:
+            lbl.config(text=msg, foreground="#b91c1c")
+            return
+
+        btn.config(state="disabled")
+        lbl.config(text="⏳ กำลังทดสอบ...", foreground="gray")
+
+        async def work():
+            reply = await self.call_ai(self.log, cfg, "ตอบคำเดียวสั้นๆ ว่า พร้อมใช้งาน", 20)
+            return reply
+
+        def run_thread():
+            try:
+                reply = asyncio.run(work())
+            except Exception as e:
+                reply = ""
+                self.log(f"❌ ทดสอบเชื่อมต่อ AI ไม่สำเร็จ: {e}")
+
+            if reply:
+                preview = reply.strip().replace("\n", " ")[:60]
+                self.ui(lbl.config, text=f"✅ เชื่อมต่อสำเร็จ: {preview}", foreground="#15803d")
+            else:
+                self.ui(lbl.config, text="❌ เชื่อมต่อไม่สำเร็จ ดู Log ประกอบ", foreground="#b91c1c")
+            self.ui(btn.config, state="normal")
+
+        threading.Thread(target=run_thread, daemon=True).start()
+
+    async def call_ai(self, log, cfg, prompt, num_predict):
+        """เรียก AI ตามผู้ให้บริการที่ตั้งไว้ log คือฟังก์ชันบันทึก log (run.log หรือ self.log)"""
+        provider = cfg.get("provider", "ollama")
+
+        try:
+            if provider == "ollama":
+                model = cfg.get("model") or "qwen3:8b"
+
+                def _post():
+                    r = requests.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": model,
+                            "prompt": "/no_think\n" + prompt,
+                            "stream": False,
+                            "think": False,
+                            "keep_alive": "30m",
+                            "options": {"temperature": 0.1, "num_predict": num_predict},
+                        },
+                        timeout=120,
+                    )
+                    r.raise_for_status()
+                    return r.json()["response"]
+
+                async with self.ai_sem:
+                    raw = await asyncio.to_thread(_post)
+                return re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+
+            if provider == "anthropic":
+                key = cfg.get("anthropic_key", "").strip()
+                model = cfg.get("anthropic_model") or ANTHROPIC_MODELS[1]
+                if not key:
+                    log("❌ ยังไม่ได้ใส่ Anthropic API key (แท็บ AI & ตัวเลือก)")
+                    return ""
+
+                def _post():
+                    r = requests.post(
+                        ANTHROPIC_API_URL,
+                        headers={
+                            "x-api-key": key,
+                            "anthropic-version": ANTHROPIC_VERSION,
+                            "content-type": "application/json",
+                        },
+                        json={
+                            "model": model,
+                            "max_tokens": max(64, num_predict * 2),
+                            "temperature": 0.2,
+                            "messages": [{"role": "user", "content": prompt}],
+                        },
+                        timeout=60,
+                    )
+                    if r.status_code == 401:
+                        raise RuntimeError("API key ไม่ถูกต้องหรือหมดอายุ")
+                    if r.status_code == 429:
+                        raise RuntimeError("ถูกจำกัดอัตราการเรียก (rate limit) รอสักครู่แล้วลองใหม่")
+                    r.raise_for_status()
+                    data = r.json()
+                    return "".join(
+                        b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+                    )
+
+                async with self.ai_sem:
+                    return (await asyncio.to_thread(_post)).strip()
+
+            if provider == "custom":
+                key = cfg.get("custom_key", "").strip()
+                base = (cfg.get("custom_base") or OPENAI_DEFAULT_BASE).rstrip("/")
+                model = cfg.get("custom_model", "").strip()
+                if not model:
+                    log("❌ ยังไม่ได้ใส่ชื่อโมเดลของ API ภายนอก (แท็บ AI & ตัวเลือก)")
+                    return ""
+
+                def _post():
+                    headers = {"Content-Type": "application/json"}
+                    if key:
+                        headers["Authorization"] = f"Bearer {key}"
+                    r = requests.post(
+                        f"{base}/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model,
+                            "temperature": 0.2,
+                            "max_tokens": max(64, num_predict * 2),
+                            "messages": [{"role": "user", "content": prompt}],
+                        },
+                        timeout=60,
+                    )
+                    if r.status_code == 401:
+                        raise RuntimeError("API key ไม่ถูกต้องหรือหมดอายุ")
+                    if r.status_code == 429:
+                        raise RuntimeError("ถูกจำกัดอัตราการเรียก (rate limit) รอสักครู่แล้วลองใหม่")
+                    r.raise_for_status()
+                    return r.json()["choices"][0]["message"]["content"]
+
+                async with self.ai_sem:
+                    return (await asyncio.to_thread(_post)).strip()
+
+            log(f"❌ ไม่รู้จักผู้ให้บริการ AI: {provider}")
+            return ""
+
+        except Exception as e:
+            log(f"❌ เรียก AI ไม่สำเร็จ ({provider}): {e}")
+            return ""
+
+    # =========================================================
     # OLLAMA MODEL MANAGEMENT
     # =========================================================
 
@@ -1346,6 +1815,8 @@ class FormBotGUI:
         return False
 
     def update_model_status(self, _e=None):
+        if self.current_provider_key() != "ollama":
+            return
         if self.ollama_ok is None:
             text = "กำลังตรวจ Ollama..."
         elif not self.ollama_ok:
@@ -1362,6 +1833,8 @@ class FormBotGUI:
         self.ai_status.config(text=text)
 
     def start_pull(self):
+        if self.current_provider_key() != "ollama":
+            return
         name = self.model_var.get().strip()
         if not name:
             messagebox.showwarning("แจ้งเตือน", "กรุณาใส่ชื่อโมเดล")
@@ -1413,18 +1886,31 @@ class FormBotGUI:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def check_model(self, model):
-        try:
-            r = requests.get(OLLAMA_TAGS_URL, timeout=4)
-            names = [m["name"] for m in r.json().get("models", [])]
-            self.installed = names
-            if not self.model_installed(model):
-                self.log(
-                    f"⚠️ ยังไม่ได้ดาวน์โหลดโมเดล '{model}' "
-                    "(ข้อที่ไม่ได้กำหนดคำตอบจะตอบไม่ได้) ไปที่แท็บ AI แล้วกดดาวน์โหลด"
-                )
-        except Exception:
-            self.log("⚠️ เชื่อมต่อ Ollama ไม่ได้ ข้อที่ต้องใช้ AI จะถูกข้าม")
+    def check_ai_ready(self, s):
+        if not s.get("ai_all", True):
+            return
+
+        provider = s.get("provider", "ollama")
+
+        if provider == "ollama":
+            model = s.get("model", "qwen3:8b")
+            try:
+                r = requests.get(OLLAMA_TAGS_URL, timeout=4)
+                names = [m["name"] for m in r.json().get("models", [])]
+                self.installed = names
+                if not self.model_installed(model):
+                    self.log(
+                        f"⚠️ ยังไม่ได้ดาวน์โหลดโมเดล '{model}' "
+                        "(ข้อที่ไม่ได้กำหนดคำตอบจะตอบไม่ได้) ไปที่แท็บ AI แล้วกดดาวน์โหลด"
+                    )
+            except Exception:
+                self.log("⚠️ เชื่อมต่อ Ollama ไม่ได้ ข้อที่ต้องใช้ AI จะถูกข้าม")
+            return
+
+        if provider == "anthropic" and not s.get("anthropic_key"):
+            self.log("⚠️ ยังไม่ได้ใส่ Claude API key (ข้อที่ต้องใช้ AI จะถูกข้าม)")
+        elif provider == "custom" and not s.get("custom_model"):
+            self.log("⚠️ ยังไม่ได้ใส่ชื่อโมเดลของ API ภายนอก (ข้อที่ต้องใช้ AI จะถูกข้าม)")
 
     # =========================================================
     # FIXED ANSWERS
@@ -1562,14 +2048,26 @@ class FormBotGUI:
             "answers_version": 2,
             "profiles": self.profiles,
             "model": self.model_var.get(),
+            "provider_label": self.provider_var.get(),
+            "anthropic_key": self.anthropic_key_var.get(),
+            "anthropic_model": self.anthropic_model_var.get(),
+            "custom_base": self.custom_base_var.get(),
+            "custom_key": self.custom_key_var.get(),
+            "custom_model": self.custom_model_var.get(),
             "x_urls": self.get_x_urls(),
             "interval": self.interval_var.get(),
             "max_age": self.max_age_var.get(),
             "parallel": self.parallel_var.get(),
             "per_form": self.per_form_var.get(),
+            "link_map_text": self.link_map_box.get("1.0", "end").rstrip("\n"),
             "run_latest": self.run_latest_var.get(),
             "keywords": self.keyword_entry.get(),
             "answers_text": self.answers_text,
+            "knowledge_text": self.knowledge_box.get("1.0", "end").rstrip("\n"),
+            "keys_text": self.keys_entry.get(),
+            "notag_process": self.notag_var.get(),
+            "post_limit": self.post_limit_var.get(),
+            "unlock": self.unlock_var.get(),
             "screenshot": self.shot_var.get(),
             "form_url": self.url_entry.get(),
         }
@@ -1604,7 +2102,17 @@ class FormBotGUI:
                 }
 
             self.show_profile(0)
-            self.model_var.set(data.get("model", "qwen3:1.7b"))
+            self.model_var.set(data.get("model", "qwen3:8b"))
+            self.provider_var.set(
+                data.get("provider_label")
+                if data.get("provider_label") in PROVIDER_LABELS
+                else PROVIDER_LABELS[0]
+            )
+            self.anthropic_key_var.set(data.get("anthropic_key", ""))
+            self.anthropic_model_var.set(data.get("anthropic_model", ANTHROPIC_MODELS[1]))
+            self.custom_base_var.set(data.get("custom_base", OPENAI_DEFAULT_BASE))
+            self.custom_key_var.set(data.get("custom_key", ""))
+            self.custom_model_var.set(data.get("custom_model", ""))
 
             urls = data.get("x_urls")
             if urls is None and data.get("x_url"):
@@ -1615,6 +2123,8 @@ class FormBotGUI:
             self.max_age_var.set(data.get("max_age", 3))
             self.parallel_var.set(data.get("parallel", 3))
             self.per_form_var.set(data.get("per_form", False))
+            self.link_map_box.delete("1.0", "end")
+            self.link_map_box.insert("1.0", data.get("link_map_text", ""))
             self.run_latest_var.set(data.get("run_latest", False))
             self.keyword_entry.insert(0, data.get("keywords", ""))
             self.shot_var.set(data.get("screenshot", True))
@@ -1628,6 +2138,13 @@ class FormBotGUI:
             self.answers_text = text
             self.answers_box.delete("1.0", "end")
             self.answers_box.insert("1.0", self.answers_text)
+
+            self.knowledge_box.delete("1.0", "end")
+            self.knowledge_box.insert("1.0", data.get("knowledge_text", DEFAULT_KNOWLEDGE) or "")
+            self.keys_entry.insert(0, data.get("keys_text", ""))
+            self.notag_var.set(data.get("notag_process", True))
+            self.post_limit_var.set(data.get("post_limit", 10))
+            self.unlock_var.set(data.get("unlock", False))
 
             self.auto_submit_var.set(data.get("auto_submit", True))
             self.submit_delay_var.set(data.get("submit_delay", 2))
@@ -1833,31 +2350,7 @@ class FormBotGUI:
         return "\n".join(extra)[:500]
 
     async def _generate(self, run, prompt, num_predict):
-        model = self.settings.get("model", "qwen3:1.7b")
-
-        def _post():
-            r = requests.post(
-                OLLAMA_URL,
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "think": False,
-                    "keep_alive": "30m",
-                    "options": {"temperature": 0.1, "num_predict": num_predict},
-                },
-                timeout=120,
-            )
-            r.raise_for_status()
-            return r.json()["response"]
-
-        try:
-            async with self.ai_sem:
-                raw = await asyncio.to_thread(_post)
-            return re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
-        except Exception as e:
-            run.log(f"❌ Ollama Error: {e}")
-            return ""
+        return await self.call_ai(run.log, self.settings, prompt, num_predict)
 
     async def ask_ai_text(self, run, question, hint="", long=False):
         """ให้ AI อ่านคำถามแล้วตอบ (คำตอบแบบพิมพ์) hint = รูปแบบคำตอบที่ต้องการ, long = ตอบยาวได้ (ช่องย่อหน้า)"""
@@ -1875,6 +2368,11 @@ class FormBotGUI:
         detail = self.build_detail(run, question)
         extra = ("คำอธิบายเพิ่มเติมของข้อนี้: " + detail + "\n") if detail else ""
         ftitle = run.form_title or "-"
+        kb = (self.settings.get("knowledge") or "").strip()
+        kb_block = (
+            f"ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ถ้าตรงกับคำถาม ไม่เกี่ยวก็ไม่ต้องใช้):\n{kb}\n\n"
+            if kb else ""
+        )
         size_rule = (
             "ตอบ 1-3 ประโยคสั้นๆ ตรงประเด็น"
             if long
@@ -1882,12 +2380,11 @@ class FormBotGUI:
         )
         hint_rule = f"- {hint}\n" if hint else ""
 
-        prompt = f"""/no_think
-คุณคือผู้ตอบแบบฟอร์มออนไลน์ อ่านคำถามให้เข้าใจก่อน แล้วตอบให้ตรงคำถาม
+        prompt = f"""คุณคือผู้ตอบแบบฟอร์มออนไลน์ อ่านคำถามให้เข้าใจก่อน แล้วตอบให้ตรงคำถาม
 
 ชื่อแบบฟอร์ม: {ftitle}
 {extra}
-กติกา:
+{kb_block}กติกา:
 - {size_rule}
 {hint_rule}- ห้ามขึ้นต้นด้วย "ตอบ:" หรือ "คำตอบ:" ห้ามทวนคำถาม ห้ามอธิบายเพิ่ม
 - ถ้าถามความชอบหรือความคิดเห็น ให้ตอบชื่อหรือข้อความที่เป็นไปได้ 1 อย่างเลย ห้ามตอบว่าไม่ทราบ
@@ -1924,6 +2421,11 @@ class FormBotGUI:
         detail = self.build_detail(run, question, choices)
         extra = ("คำอธิบายเพิ่มเติมของข้อนี้: " + detail + "\n") if detail else ""
         ftitle = run.form_title or "-"
+        kb = (self.settings.get("knowledge") or "").strip()
+        kb_block = (
+            f"ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ถ้าตรงกับคำถาม ไม่เกี่ยวก็ไม่ต้องใช้):\n{kb}\n\n"
+            if kb else ""
+        )
         opts = "\n".join(f"{i}. {c}" for i, c in enumerate(choices, start=1))
 
         if multi:
@@ -1931,12 +2433,11 @@ class FormBotGUI:
         else:
             how = "ตอบเป็นหมายเลขเดียวเท่านั้น"
 
-        prompt = f"""/no_think
-คุณคือผู้ตอบแบบฟอร์มออนไลน์ อ่านคำถามและตัวเลือกให้เข้าใจก่อนตอบ
+        prompt = f"""คุณคือผู้ตอบแบบฟอร์มออนไลน์ อ่านคำถามและตัวเลือกให้เข้าใจก่อนตอบ
 
 ชื่อแบบฟอร์ม: {ftitle}
 {extra}
-คำถาม: {question}
+{kb_block}คำถาม: {question}
 
 ตัวเลือก:
 {opts}
@@ -2011,6 +2512,14 @@ class FormBotGUI:
         return None
 
     @staticmethod
+    def valid_thai_id(digits):
+        """ตรวจเลขบัตรประชาชนไทย 13 หลักด้วย checksum"""
+        if len(digits) != 13 or not digits.isdigit():
+            return False
+        total = sum(int(d) * (13 - i) for i, d in enumerate(digits[:12]))
+        return (11 - total % 11) % 10 == int(digits[12])
+
+    @staticmethod
     def age_from_birthdate(bd):
         m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", bd or "")
         if not m:
@@ -2070,11 +2579,37 @@ class FormBotGUI:
         if re.search(r"ที่อยู่|address|ที่พัก", raw):
             return profile["address"]
 
+        if re.search(
+            r"เลขบัตรประชาชน|เลขประจำตัวประชาชน|บัตรประชาชน|เลข\s*ปชช|"
+            r"national\s*id|citizen\s*id|\bid\s*card\b|เลขบัตร\s*(ประชาชน)?",
+            raw,
+        ) and not re.search(r"user\s*id|ไอดี\s*ไลน์|line\s*id|student\s*id|employee\s*id", raw):
+            nid = re.sub(r"[^0-9]", "", profile["national_id"] or "")
+            if nid and not self.valid_thai_id(nid):
+                run_log = getattr(run, "log", None)
+                if run_log:
+                    run_log(f"⚠️ เลขบัตรประชาชนที่กรอกไว้ '{profile['national_id']}' อาจไม่ถูกต้อง (เช็กซัม/จำนวนหลักไม่ผ่าน) แต่จะกรอกให้ตามที่ตั้งไว้")
+            return nid
+
         if re.search(r"line\s*id|ไอดี\s*ไลน์|ไลน์|\bline\b", raw):
             return profile["line_id"]
 
         if re.search(r"twitter|ทวิต|\bx\s*(username|id|handle|account)|ไอดี\s*x\b|อิกซ์", raw):
             return profile["x_handle"]
+
+        # บัญชี/Username ทั่วไป (เช่น ระบบจองบัตร, เกม, สมาชิก) - รองรับทั้งคำว่า "account" ภาษาอังกฤษ
+        # และ "บัญชี" ภาษาไทย แต่ไม่จับกรณีที่เข้าข่ายบัญชีธนาคาร ซึ่งเป็นข้อมูลการเงิน
+        if (
+            re.search(r"username|ยูสเซอร์เนม|user\s*account|\baccount\b", raw)
+            or (
+                "บัญชี" in raw
+                and re.search(r"ผู้ใช้|สมาชิก|เกม|ระบบ|จองบัตร|จองคิว|ไอดี", raw)
+            )
+        ) and not re.search(
+            r"ธนาคาร|bank|พร้อมเพย์|promptpay|เลขที่บัญชี|account\s*number|bank\s*account",
+            raw,
+        ):
+            return profile["account"]
 
         return None
 
@@ -3035,14 +3570,9 @@ class FormBotGUI:
         )
         return u
 
-    async def extract_form_links(self, article):
-        """
-        คืนลิงก์ฟอร์มตามลำดับในโพสต์ "เก็บลิงก์ซ้ำไว้ด้วย"
-        (ลิงก์เดียวกัน 2 ตำแหน่ง = 2 ลิงก์ เพื่อใช้กับข้อมูลคนละชุดได้)
-        ข้ามลิงก์ในการ์ดพรีวิว เพราะซ้ำกับลิงก์ในข้อความ
-        """
+    async def _links_from_anchors(self, article, want_card):
+        """เก็บลิงก์ฟอร์มจาก <a> ในโพสต์ want_card=False อ่านเฉพาะลิงก์ในเนื้อข้อความ, True อ่านเฉพาะลิงก์ในการ์ดพรีวิว"""
         found = []
-
         anchors = article.locator("a[href]")
         n = await anchors.count()
 
@@ -3052,7 +3582,7 @@ class FormBotGUI:
                 in_card = await a.evaluate(
                     "el => !!el.closest('[data-testid=\"card.wrapper\"]')"
                 )
-                if in_card:
+                if in_card != want_card:
                     continue
 
                 href = await a.get_attribute("href") or ""
@@ -3075,7 +3605,23 @@ class FormBotGUI:
             except Exception:
                 continue
 
-        # สำรอง: ถ้าไม่เจอจาก anchor ให้ลองอ่านจากข้อความ
+        return found
+
+    async def extract_form_links(self, article):
+        """
+        คืนลิงก์ฟอร์มตามลำดับในโพสต์ "เก็บลิงก์ซ้ำไว้ด้วย"
+        (ลิงก์เดียวกัน 2 ตำแหน่ง = 2 ลิงก์ เพื่อใช้กับข้อมูลคนละชุดได้)
+
+        อ่านจากลิงก์ในเนื้อข้อความก่อน (กันนับซ้ำกับการ์ดพรีวิวที่โผล่คู่กัน)
+        ถ้าในเนื้อข้อความไม่มีลิงก์เลย (โพสต์ที่มีแต่การ์ดพรีวิว ไม่มีลิงก์เป็นตัวหนังสือ)
+        ให้ใช้ลิงก์จากการ์ดพรีวิวแทน จะได้ไม่พลาดแบบนี้
+        """
+        found = await self._links_from_anchors(article, want_card=False)
+
+        if not found:
+            found = await self._links_from_anchors(article, want_card=True)
+
+        # สำรอง: ถ้ายังไม่เจอจาก anchor เลย ให้ลองอ่านจากข้อความทั้งหมด
         if not found:
             try:
                 text = await article.inner_text()
@@ -3203,10 +3749,30 @@ class FormBotGUI:
         state.done_posts.add(pid)
         self.save_done(state.done_posts, state.done_forms)
 
+        keys = s.get("keys") or set()
+        if keys:
+            day = self.extract_post_day(text)
+            if day is not None and day not in keys:
+                shown = ", ".join(f"{k:02d}" for k in sorted(keys))
+                self.log(f"⏭️ [{label}] โพสต์นี้เป็นวันที่ {day:02d} ไม่ตรงกับคีย์ที่เปิดใช้งาน ({shown}) ข้าม")
+                return
+            if day is None and not s.get("notag_process", True):
+                self.log(f"⏭️ [{label}] โพสต์นี้ไม่มีป้ายวันที่ และตั้งค่าให้ข้ามโพสต์แบบนี้")
+                return
+
         keywords = s["keywords"]
         if keywords and not any(k in text.lower() for k in keywords):
             self.log(f"⏭️ [{label}] โพสต์นี้ไม่มีคีย์เวิร์ดที่กำหนด ข้าม")
             return
+
+        post_limit = s.get("post_limit", 0)
+        if post_limit > 0 and state.processed >= post_limit:
+            self.log(
+                f"⛔ [{label}] ถึงจำนวนโพสต์สูงสุดที่ตั้งไว้ ({post_limit}) แล้ว ข้ามโพสต์นี้ "
+                "(ปลดล็อกได้ในแท็บ X & ฟอร์ม)"
+            )
+            return
+        state.processed += 1
 
         links = [u for u in links if u not in state.done_forms]
 
@@ -3222,14 +3788,23 @@ class FormBotGUI:
             state.done_forms.add(u)
         self.save_done(state.done_posts, state.done_forms)
 
-        async def run_one(n, link):
+        jobs = []  # (tag, link, profile, pname)
+        for n, link in enumerate(links, start=1):
+            reps = self.get_link_profiles(n, s)
+            for j, (profile, pname) in enumerate(reps, start=1):
+                tag = f"{label}:{n}" if len(reps) == 1 else f"{label}:{n}.{j}"
+                jobs.append((tag, link, profile, pname))
+
+        if len(jobs) != len(links):
+            self.log(f"🔁 [{label}] ตั้งค่าให้กรอกซ้ำ รวมทั้งหมด {len(jobs)} รายการ (จาก {len(links)} ลิงก์)")
+
+        async def run_one(tag, link, profile, pname):
             async with state.sem:
                 if self.stop_event.is_set():
                     return "cancelled"
 
-                profile, pname = self.pick_profile(n, s)
-                run = FormRun(self, f"{label}:{n}", profile, pname)
-                run.log(f"เริ่มลิงก์ {n}/{len(links)} (ใช้{pname})")
+                run = FormRun(self, tag, profile, pname)
+                run.log(f"เริ่ม {tag.split(':', 1)[-1]} (ใช้{pname})")
 
                 fpage = await context.new_page()  # เปิดค้างไว้ให้ตรวจ
                 try:
@@ -3243,15 +3818,15 @@ class FormBotGUI:
                 return result
 
         results = await asyncio.gather(
-            *[run_one(n, l) for n, l in enumerate(links, start=1)],
+            *[run_one(*job) for job in jobs],
             return_exceptions=True,
         )
 
         sent = sum(1 for r in results if r == "submitted")
         ready = sum(1 for r in results if r == "ready")
-        bad = len(links) - sent - ready
+        bad = len(jobs) - sent - ready
         self.notify(
-            f"🔔 [{label}] ส่งแล้ว {sent} | รอตรวจ/กดส่งเอง {ready} | มีปัญหา {bad} (จาก {len(links)} ฟอร์ม)"
+            f"🔔 [{label}] ส่งแล้ว {sent} | รอตรวจ/กดส่งเอง {ready} | มีปัญหา {bad} (จาก {len(jobs)} รายการ)"
         )
         self.ui(self.show_summary, True)
 
@@ -3385,8 +3960,15 @@ class FormBotGUI:
             "parallel": max(1, min(10, int(self.parallel_var.get()))),
             "run_latest": self.run_latest_var.get(),
             "per_form": self.per_form_var.get(),
+            "link_map": self.parse_link_map(self.link_map_box.get("1.0", "end")),
             "profiles": [dict(p) for p in self.profiles],
             "model": self.model_var.get().strip(),
+            "provider": self.current_provider_key(),
+            "anthropic_key": self.anthropic_key_var.get().strip(),
+            "anthropic_model": self.anthropic_model_var.get().strip() or ANTHROPIC_MODELS[1],
+            "custom_base": self.custom_base_var.get().strip() or OPENAI_DEFAULT_BASE,
+            "custom_key": self.custom_key_var.get().strip(),
+            "custom_model": self.custom_model_var.get().strip(),
             "headless": self.headless_var.get(),
             "screenshot": self.shot_var.get(),
             "auto_submit": self.auto_submit_var.get(),
@@ -3395,6 +3977,10 @@ class FormBotGUI:
             "name_mode": NAME_MODES.get(self.name_mode_var.get(), "auto"),
             "keywords": keywords,
             "fixed": self.parse_fixed(self.answers_text),
+            "knowledge": self.knowledge_box.get("1.0", "end").strip(),
+            "keys": self.parse_keys(self.keys_entry.get()),
+            "notag_process": self.notag_var.get(),
+            "post_limit": 0 if self.unlock_var.get() else max(0, int(self.post_limit_var.get())),
         }
         return s
 
@@ -3478,7 +4064,7 @@ class FormBotGUI:
         self.ai_cache = {}
         self.ai_sem = asyncio.Semaphore(2)
 
-        await asyncio.to_thread(self.check_model, s["model"])
+        await asyncio.to_thread(self.check_ai_ready, s)
 
         async with async_playwright() as p:
             headless = s["headless"]
