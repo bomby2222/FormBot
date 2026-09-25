@@ -17,6 +17,9 @@ import csv
 import difflib
 import html
 from datetime import datetime, timezone
+import win32api
+import win32con
+import win32gui
 def _ensure_packages():
     """ถ้ายังไม่มี requests / playwright ให้ถามแล้วติดตั้งให้อัตโนมัติ"""
     if getattr(sys, "frozen", False):  # โปรแกรมที่แพ็กแล้ว (.exe/.app) มีทุกอย่างในตัวอยู่แล้ว

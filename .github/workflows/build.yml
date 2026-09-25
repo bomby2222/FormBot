@@ -77,7 +77,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ติดตั้ง Chromium ไว้นอก package ของ Playwright
       - name: Install Playwright Chromium
         run: |
           python -m playwright install chromium
@@ -85,7 +84,6 @@ jobs:
           echo "Playwright browser files:"
           ls -la "$HOME/Library/Caches/ms-playwright"
 
-      # Build FormBot.app ก่อน โดยยังไม่เอา Chromium เข้า PyInstaller
       - name: Build FormBot.app
         run: |
           rm -rf build dist FormBot.spec
@@ -100,8 +98,7 @@ jobs:
             --collect-all playwright \
             main.py
 
-      # Copy Chromium เข้า .app หลัง PyInstaller สร้าง app เสร็จ
-      - name: Bundle Chromium into FormBot.app
+      - name: Bundle Chromium
         run: |
           mkdir -p "dist/FormBot.app/Contents/Resources/ms-playwright"
 
@@ -109,10 +106,6 @@ jobs:
             "$HOME/Library/Caches/ms-playwright" \
             "dist/FormBot.app/Contents/Resources/ms-playwright"
 
-          echo "Chromium bundled:"
-          du -sh "dist/FormBot.app/Contents/Resources/ms-playwright"
-
-      # ล้าง quarantine และ sign แบบ local/ad-hoc
       - name: Sign FormBot.app
         run: |
           xattr -cr "dist/FormBot.app" || true
@@ -129,7 +122,6 @@ jobs:
             --strict \
             "dist/FormBot.app"
 
-      # Zip โดยรักษาโครงสร้าง macOS app
       - name: Package macOS APP
         run: |
           cd dist
